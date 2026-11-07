@@ -74,6 +74,13 @@ class MuxOptions {
   /// Client ping cadence; a missing pong closes the socket (dead-link
   /// detection). Used by WebSocket carriers; tunnel carriers run their own
   /// health checks.
+  ///
+  /// The deadline is the same value: `dart:io` closes a WebSocket whose pong
+  /// does not arrive within one interval. A link that is busy carrying a
+  /// multi-megabyte frame cannot answer a ping in time — the frame, not the
+  /// connection, is the delay — so the client tore the socket down and
+  /// re-read the whole snapshot, over and over. A slow link needs a longer
+  /// interval than a local one.
   final Duration pingInterval;
 
   /// Backoff caps per attempt (50-100 % jitter), the last one repeats; same

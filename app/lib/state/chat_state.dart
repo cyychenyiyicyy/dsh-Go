@@ -1856,14 +1856,15 @@ class ChatController extends Notifier<ChatState> {
         identical(client.mux.generation, generation);
     state = state.copyWith(loadingOlder: true);
     try {
-      // Same window as the official web client: back to a turn start (at
-      // least 50 messages, two turns), so the oldest loaded turn keeps its
-      // `turn/start` (footnote, fold); 500 caps one giant turn.
+      // Back to a turn start (at least 50 messages, two turns), so the oldest
+      // loaded turn keeps its `turn/start` (footnote, fold). 120 caps one
+      // page: the page is one response, and a longer window made loading
+      // older history read megabytes over a slow tunnel.
       final page = await client.history(
         sessionId,
         throughSeq: _transcript.newestSeq ?? oldest,
         beforeSeq: oldest,
-        maxMessages: 500,
+        maxMessages: 120,
         turnWindow: const TurnWindow(50, 2),
       );
       if (!current()) return;

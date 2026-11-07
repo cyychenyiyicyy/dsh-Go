@@ -43,7 +43,7 @@ class _Client extends DshClient {
   final Set<String> running;
 
   @override
-  Future<List<SessionSummary>> listSessions() async => [
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async => [
     for (final id in ['s1', 's2', 's3']) notify.session(id, running: running.contains(id)),
   ];
 }

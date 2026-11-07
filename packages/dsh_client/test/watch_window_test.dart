@@ -12,13 +12,13 @@ import 'support/fake_dsh.dart';
 const _fastMux = MuxOptions(readyTimeout: Duration(seconds: 2), retryCaps: [Duration(milliseconds: 20)]);
 
 void main() {
-  test('the default window: at least 50 messages and two turns, capped at 500', () {
+  test('the default window: at least 50 messages and two turns, capped at 120', () {
     const options = WatchOptions();
-    expect(options.maxMessages, 500);
+    expect(options.maxMessages, 120);
     expect(options.turnWindow?.toJson(), {'minMessages': 50, 'minTurns': 2});
   });
 
-  test('watch sends maxMessages 500 with the turn window by default', () async {
+  test('watch sends maxMessages 120 with the turn window by default', () async {
     final host = await FakeDsh.start();
     addTearDown(host.close);
     final opened = Completer<Map<String, Object?>>();
@@ -32,7 +32,7 @@ void main() {
 
     final payload = await opened.future.timeout(const Duration(seconds: 5));
     final request = (payload['args']! as Map)['request']! as Map;
-    expect(request['maxMessages'], 500);
+    expect(request['maxMessages'], 120);
     expect(request['turnWindow'], {'minMessages': 50, 'minTurns': 2});
   });
 }

@@ -174,6 +174,11 @@ final sshLinkFactoryProvider = Provider<SshLinkFactory>(
       // confirmed in the UI (test connection / host sheet), so an unknown key
       // at this point fails closed.
       kicks: ref.read(networkKicksProvider),
+      // Four attempts, not eight: each one re-runs the whole chain (SSH →
+      // remote `dsh web` → tunnel → sign-in), and the backoff between them
+      // already grows to 8 s. Eight of those is minutes of spinner before
+      // the user is told anything.
+      backoff: Backoff(maxAttempts: 4),
     );
   },
 );

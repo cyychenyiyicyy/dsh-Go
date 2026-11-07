@@ -21,6 +21,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'background_frame_decode.dart';
 import 'binary_response.dart';
 import 'connection.dart';
 import 'errors.dart';
@@ -190,6 +191,11 @@ class DshHttpCarrier extends DshCarrier {
 /// `/api/remote.mux`: one JSON text frame per WebSocket message. The Host
 /// pings every 2 s (`dart:io` answers); [pingInterval] adds client pings for
 /// dead-link detection.
+///
+/// A frame may be a conversation's whole opening snapshot — megabytes of
+/// history in one message. Decoding that on the UI isolate froze the app, so
+/// big frames are parsed in a worker isolate and only the finished frame
+/// crosses back.
 class _WebSocketMuxLink implements DshMuxLink {
   _WebSocketMuxLink(this._socket, this._tracer, Duration pingInterval) {
     _socket.pingInterval = pingInterval;
@@ -199,6 +205,10 @@ class _WebSocketMuxLink implements DshMuxLink {
   final DshTracer? _tracer;
   DshMuxLossHandler? _onLost;
   bool _lost = false;
+
+  /// One frame at a time: a burst of big frames queues instead of spawning
+  /// an unbounded number of workers.
+  Future<void> _pending = Future<void>.value();
 
   @override
   void start({required DshMuxFrameHandler onFrame, required DshMuxLossHandler onLost}) {
@@ -210,18 +220,12 @@ class _WebSocketMuxLink implements DshMuxLink {
           _protocolFailure('binary WebSocket message');
           return;
         }
-        final frame = asMap(tryDecodeJson(data));
-        final streamId = asString(frame?['streamId']);
-        final type = asString(frame?['type']);
-        if (frame == null ||
-            streamId == null ||
-            streamId.isEmpty ||
-            (type != 'item' && type != 'end' && type != 'error')) {
-          _protocolFailure('invalid Remote stream frame');
+        if (data.length >= backgroundFrameThresholdBytes) {
+          // Decode off the UI isolate, in order, so a burst cannot pile up.
+          _pending = _pending.then((_) => _deliverBigFrame(data, onFrame));
           return;
         }
-        _tracer?.call(DshTraceEntry('in', 'mux', frame));
-        onFrame(frame);
+        _deliverSmallFrame(data, onFrame);
       },
       onError: (Object error) => _lose(DshCarrierLostException('WebSocket error: $error'), null),
       onDone: () => _lose(
@@ -232,6 +236,38 @@ class _WebSocketMuxLink implements DshMuxLink {
       ),
       cancelOnError: true,
     );
+  }
+
+  void _deliverSmallFrame(String data, DshMuxFrameHandler onFrame) {
+    final frame = asMap(tryDecodeJson(data));
+    if (frame == null || !_valid(frame)) {
+      _protocolFailure('invalid Remote stream frame');
+      return;
+    }
+    _tracer?.call(DshTraceEntry('in', 'mux', frame));
+    onFrame(frame);
+  }
+
+  Future<void> _deliverBigFrame(String data, DshMuxFrameHandler onFrame) async {
+    if (_lost) return;
+    final decoded = await decodeFrameInWorker(data);
+    if (_lost) return;
+    final frame = asMap(decoded);
+    if (frame == null || !_valid(frame)) {
+      _protocolFailure('invalid Remote stream frame');
+      return;
+    }
+    _tracer?.call(DshTraceEntry('in', 'mux', frame));
+    onFrame(frame);
+  }
+
+  bool _valid(Map<String, Object?>? frame) {
+    final streamId = asString(frame?['streamId']);
+    final type = asString(frame?['type']);
+    return frame != null &&
+        streamId != null &&
+        streamId.isNotEmpty &&
+        (type == 'item' || type == 'end' || type == 'error');
   }
 
   void _lose(DshCarrierLostException failure, Object? cause) {

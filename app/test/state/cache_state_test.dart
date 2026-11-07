@@ -50,7 +50,7 @@ class _Client extends DshClient {
   @override
   Stream<SessionControlUpdate> watchSessionControl() => controls.stream;
   @override
-  Future<List<SessionSummary>> listSessions() {
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) {
     listCalls++;
     return lists.isEmpty ? Future.value(rows) : lists.removeAt(0).future;
   }
@@ -62,7 +62,7 @@ class _Client extends DshClient {
   }
 
   @override
-  Future<SessionProjections?> projections(String sessionId) => seed?.future ?? Future.value(SessionProjections.empty);
+  Future<SessionProjections?> projections(String sessionId, {Duration? timeout}) => seed?.future ?? Future.value(SessionProjections.empty);
 
   Future<void> release() async {
     await hosts.close();

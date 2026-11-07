@@ -32,7 +32,32 @@ typedef DshClientConnector = Future<DshClient> Function({
 });
 
 Future<DshClient> _defaultConnector({required Uri baseUri, required String token, required String hostHeader}) =>
-    DshClient.connect(baseUri: baseUri, token: token, hostHeader: hostHeader);
+    DshClient.connect(
+      baseUri: baseUri,
+      token: token,
+      hostHeader: hostHeader,
+      // A remote Host's `session/list` is megabytes of JSON: every stored
+      // session, archived and subagent ones included, each with its
+      // projections. Decoding that on the UI isolate is what froze the app
+      // during startup sync — the frames simply stopped being drawn. The
+      // background read hands the HTTP, the gzip and the JSON to a worker
+      // isolate; only the rows cross back.
+      backgroundSessionLists: true,
+      // A tunnel is a slow, lossy pipe: one TCP connect opens one SSH
+      // channel, and a request that has not answered in 45 s is not going
+      // to. The stock 120 s request timeout turned a half-open tunnel into
+      // a two-minute spinner.
+      connectTimeout: const Duration(seconds: 20),
+      requestTimeout: const Duration(seconds: 45),
+      // A ping's pong must come back within one interval, or `dart:io`
+      // closes the socket. Over a tunnel that carries a conversation's whole
+      // opening snapshot in one WebSocket message, the frame itself can take
+      // longer than 15 s — and a closed socket means re-reading the whole
+      // snapshot again. The stock 15 s interval turned one slow link into an
+      // endless reload: the app downloaded the same snapshot dozens of times
+      // and the UI never got a frame.
+      muxOptions: const MuxOptions(pingInterval: Duration(seconds: 90)),
+    );
 
 /// Trust-on-first-use check against the pinned fingerprint.
 enum HostKeyVerdict { trusted, unknown, mismatch }
@@ -70,6 +95,7 @@ class SshHostLink implements HostLink {
     this.keepAliveInterval = const Duration(seconds: 15),
     this.keepAliveTimeout = const Duration(seconds: 10),
     this.tunnelProbeTimeout = const Duration(seconds: 10),
+    this.connectBudget = const Duration(seconds: 120),
     this.retryFirstOpen = true,
   }) : _transportFactory = transportFactory ?? DartSshTransport.connect,
        _connectClient = connectClient ?? _defaultConnector,
@@ -90,6 +116,13 @@ class SshHostLink implements HostLink {
 
   /// Bounds the initial probe and subsequent forwarded channel opens.
   final Duration tunnelProbeTimeout;
+
+  /// Bounds one whole attempt: SSH → remote `dsh web` → tunnel → sign-in.
+  ///
+  /// Every phase has a timeout of its own, but their sum was minutes — and
+  /// the retry loop then did that again, eight times. One attempt now gets a
+  /// budget, and whatever is left of it is all the remote start may use.
+  final Duration connectBudget;
 
   /// False for "测试连接": report the first failure instead of retrying.
   final bool retryFirstOpen;
@@ -197,6 +230,23 @@ class SshHostLink implements HostLink {
     if (_closed) throw StateError('link closed');
   }
 
+  /// Ends the attempt when it has used up its budget.
+  ///
+  /// Without this the phases simply added up: a 60 s remote start followed by
+  /// a 45 s sign-in is two minutes of spinner before anybody learns that the
+  /// attempt was doomed.
+  void _checkBudget(DateTime deadline) {
+    if (_closed) throw StateError('link closed');
+    if (DateTime.now().isAfter(deadline)) {
+      throw HostLinkError(
+        HostLinkErrorKind.unreachable,
+        appL10n.remoteErrSshUnresponsive,
+        detail: 'the attempt used up its ${connectBudget.inSeconds}s budget',
+        retryable: true,
+      );
+    }
+  }
+
   /// One full attempt. Reuses the forwarder and, when the remote endpoint is
   /// unchanged, the existing DshClient.
   Future<DshClient> _connectOnce() async {
@@ -206,6 +256,7 @@ class SshHostLink implements HostLink {
       _emit(step);
     }
 
+    final deadline = DateTime.now().add(connectBudget);
     at(HostLinkStep.connect, detail: _config.address);
     final secrets = await _loadSecrets();
     _checkOpen();
@@ -245,17 +296,23 @@ class SshHostLink implements HostLink {
     _connectingTransport = transport;
     at(HostLinkStep.startDsh, detail: appL10n.remoteCheckingDsh);
     try {
+      // Whatever is left of this attempt's budget is all the remote start
+      // may use. A remote that needs a full minute to boot is already the
+      // slow case; a budget that is nearly spent must not start one at all.
+      final left = deadline.difference(DateTime.now());
       final bootstrap = RemoteDshBootstrap(
         transport,
         launchCommand: _config.launchCommand,
         workingDirectory: _config.workingDirectory,
         environment: remoteEnvironment,
+        startTimeout: left < const Duration(seconds: 60) ? left : const Duration(seconds: 60),
       );
       final endpoint = await bootstrap.ensureRunning(
         forceRestart: _forceRestart,
         onDetail: (d) => at(HostLinkStep.startDsh, detail: d),
       );
       _checkOpen();
+      _checkBudget(deadline);
       _forceRestart = false;
 
       at(HostLinkStep.tunnel, detail: '127.0.0.1:${endpoint.port}');
@@ -282,6 +339,7 @@ class SshHostLink implements HostLink {
         );
       }
       _checkOpen();
+      _checkBudget(deadline);
       final previous = _endpoint;
       _endpoint = endpoint;
       if (_forwarder == null) {
@@ -296,6 +354,7 @@ class SshHostLink implements HostLink {
       _installTransport(transport);
 
       at(HostLinkStep.login);
+      _checkBudget(deadline);
       final client = await _ensureClient(endpoint, previous);
       _checkOpen();
       _emit(
@@ -571,16 +630,35 @@ class SshHostLink implements HostLink {
 
   @override
   void retry() {
-    if (_closed || _status.isBusy && _status.phase != HostLinkPhase.reconnecting) return;
+    if (_closed) return;
     if (_status.phase == HostLinkPhase.reconnecting) {
       _backoff.reset();
       _delay.skip();
       return;
     }
+    if (_status.phase == HostLinkPhase.connecting) {
+      // The user asked for a fresh start. The attempt in flight may be
+      // waiting out a remote `dsh web` start or a sign-in that will not
+      // answer; abandon it and let the retry loop open again.
+      _abandonAttempt();
+      return;
+    }
+    if (_status.isBusy) return;
     if (_status.phase == HostLinkPhase.connected) unawaited(_probeDsh());
     if (_status.phase == HostLinkPhase.failed || _status.phase == HostLinkPhase.idle) {
       unawaited(open().then((_) {}, onError: (_) {}));
     }
+  }
+
+  /// Ends the attempt in flight so the next one starts on the new network.
+  ///
+  /// Closing the transport makes the pending phase fail, which the retry loop
+  /// turns into the next attempt. The SSH handshake itself is not cancellable
+  /// from here — it owns its own timeouts — but everything after it is.
+  void _abandonAttempt() {
+    _backoff.reset();
+    _connectingTransport?.close();
+    _teardownTransport();
   }
 
   @override

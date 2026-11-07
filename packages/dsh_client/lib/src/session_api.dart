@@ -29,6 +29,18 @@ enum PromptMode {
   final String wire;
 }
 
+/// Budget for one `session/list` read.
+///
+/// The list is not paged: it carries every stored session, archived and
+/// subagent ones included, each with its projections. On a Host with a long
+/// history that is megabytes — over a tunnel that is seconds of transfer on
+/// top of the parse. Thirty seconds is far beyond what a healthy Host needs
+/// and far below what a stalled one costs the user.
+const sessionListTimeout = Duration(seconds: 30);
+
+/// Budget for one `session/projections` read (one session's title fill-in).
+const sessionProjectionTimeout = Duration(seconds: 20);
+
 /// Inline image for `session/prompt` (png, jpeg, webp, gif; 20 MiB per image,
 /// 20 images and 200 MiB per message by default — see
 /// `SessionProjections.imageLimits`).
@@ -66,7 +78,7 @@ class WatchOptions {
     this.activationAllowed,
     this.onActivationChecked,
     this.turnWindow = const TurnWindow(50, 2),
-    this.maxMessages = 500,
+    this.maxMessages = 120,
     this.includeHostEvents = true,
     this.includeConnectionEvents = true,
     this.includeSyncEvents = false,
@@ -96,8 +108,13 @@ class WatchOptions {
   /// Hard cap on the initial window. The Host cuts at the [turnWindow] turn
   /// start unless this many messages come first (then mid-turn, losing that
   /// turn's `turn/start`); its own default is 50, so without a larger cap a
-  /// 50-message window cuts mid-turn. 500 as in the official web client
-  /// (`HISTORY_PAGE_OPTIONS`).
+  /// 50-message window cuts mid-turn.
+  ///
+  /// 120, not the official web client's 500 (`HISTORY_PAGE_OPTIONS`): the
+  /// window is one WebSocket message, and 500 messages of a long
+  /// conversation was several megabytes in a single frame. The rest of the
+  /// history is still reachable — the snapshot carries `hasMore`, and the
+  /// list pages it on demand.
   final int? maxMessages;
 
   /// Forward this session's approvals, questions, status and errors.
@@ -206,6 +223,8 @@ class DshClient {
     bool backgroundLists = false,
     bool startMux = true,
     Duration readyTimeout = const Duration(seconds: 20),
+    Duration connectTimeout = const Duration(seconds: 10),
+    Duration requestTimeout = const Duration(seconds: 120),
   }) async {
     var base = baseUri;
     var launchToken = token;
@@ -216,7 +235,14 @@ class DshClient {
       launchToken ??= parsed.token;
     }
     if (base == null) throw ArgumentError('baseUri or launchUrl is required');
-    final connection = DshConnection(base, hostHeader: hostHeader, cookie: cookie, tracer: tracer);
+    final connection = DshConnection(
+      base,
+      hostHeader: hostHeader,
+      cookie: cookie,
+      tracer: tracer,
+      connectTimeout: connectTimeout,
+      requestTimeout: requestTimeout,
+    );
     final client = DshClient(
       connection,
       muxOptions: muxOptions,
@@ -320,10 +346,18 @@ class DshClient {
 
   /// `session/list`: every stored session, newest first, *including archived
   /// and subagent sessions*. Filter archived ones with [watchWorkspaces].
-  Future<List<SessionSummary>> listSessions() async {
+  ///
+  /// [timeout] bounds the read: the list carries every stored session with
+  /// its projections, so on a busy Host it is megabytes of JSON. A read that
+  /// has not answered by then is not going to answer soon enough to be worth
+  /// the spinner. The background read path is bounded by the connection's own
+  /// request timeout instead.
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async {
     final read = tryBackgroundListRead(BackgroundListKind.sessions);
     if (read != null) return (await read) as List<SessionSummary>;
-    final value = asMapOrEmpty(await rpc.call('session/list', {'_request': <String, Object?>{}}));
+    final value = asMapOrEmpty(
+      await rpc.call('session/list', {'_request': <String, Object?>{}}, timeout ?? sessionListTimeout),
+    );
     return asListOrEmpty(value['items']).map(SessionSummary.fromJson).toList(growable: false);
   }
 
@@ -387,10 +421,16 @@ class DshClient {
   }
 
   /// `session/projections`: non-activating read; `null` for unknown sessions.
-  Future<SessionProjections?> projections(String sessionId) async {
-    final value = await rpc.call('session/projections', {
-      'request': {'sessionId': sessionId},
-    });
+  ///
+  /// [timeout] bounds the read: the App asks for one session's projections
+  /// at a time to fill in missing titles, and a Host that stops answering
+  /// must not hold that queue open indefinitely.
+  Future<SessionProjections?> projections(String sessionId, {Duration? timeout}) async {
+    final value = await rpc.call(
+      'session/projections',
+      {'request': {'sessionId': sessionId}},
+      timeout ?? sessionProjectionTimeout,
+    );
     return value == null ? null : SessionProjections.fromJson(value);
   }
 
@@ -1014,6 +1054,16 @@ class _SessionWatch {
   int? _assistantRevision;
   int _failures = 0;
   int _resyncs = 0;
+
+  /// Snapshots served since the last one that advanced the log.
+  ///
+  /// A snapshot that carries the same cursor as the one before it added
+  /// nothing: the follow reopened and the Host sent the same window again.
+  /// A link that cannot deliver a new frame (a slow tunnel whose pong never
+  /// arrives, a Host that keeps replaying) must not reload that window
+  /// forever — every reload is the whole conversation over the wire.
+  int _sameSnapshotCount = 0;
+  int? _lastSnapshotCursor;
   final Random _random = Random();
   Completer<bool>? _wake;
   Timer? _reconcileTimer;
@@ -1222,6 +1272,13 @@ class _SessionWatch {
         await stream?.cancel();
         if (_stopped) break;
         if (!identical(epoch.generation, client.mux.generation)) continue;
+        // The same window again: the link cannot deliver anything new, and
+        // each attempt re-reads the whole conversation. Stop here instead of
+        // reloading it a sixth time.
+        if (_sameSnapshotCount >= 3) {
+          _controller.addError(DshProtocolException(error.reason));
+          break;
+        }
         // Back-to-back resyncs back off; six without a clean frame end the watch.
         if (++_resyncs >= 6) {
           _controller.addError(DshProtocolException(error.reason));
@@ -1279,6 +1336,18 @@ class _SessionWatch {
     if (_stopped || !epoch.isCurrent || !identical(_epochGeneration, client.mux.generation)) {
       throw const DshCarrierLostException('follow snapshot belongs to a retired generation');
     }
+    // A snapshot that repeats the previous cursor carried nothing new. Count
+    // it: a link that keeps serving the same window cannot deliver the rest
+    // of the conversation, and re-reading it is what turned one slow tunnel
+    // into an endless reload.
+    if (_lastSnapshotCursor == snapshot.cursor) {
+      if (++_sameSnapshotCount >= 3) {
+        throw const _Resync('the follow keeps serving the same snapshot');
+      }
+    } else {
+      _sameSnapshotCount = 0;
+    }
+    _lastSnapshotCursor = snapshot.cursor;
     _lastSeq = snapshot.cursor;
     _failures = 0;
     _emit(snapshot.withEvents(events, followEpoch: epoch));
@@ -1332,7 +1401,11 @@ class _SessionWatch {
       _checkHistoryOwner(epoch);
       final HistoryPage page;
       try {
-        page = await client.history(sessionId, throughSeq: through, beforeSeq: beforeSeq, maxMessages: 500);
+        // A small window: the Host's `session/page` answers with the log it
+        // has, and a large `maxMessages` made one repair read megabytes of
+        // history — as much as the snapshot it was repairing. The repair
+        // wants the missing range, not the whole conversation.
+        page = await client.history(sessionId, throughSeq: through, beforeSeq: beforeSeq, maxMessages: 120);
       } catch (_) {
         // Closing the client keeps the original terminal error contract;
         // only a live successor must be protected from stale recovery.

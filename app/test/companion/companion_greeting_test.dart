@@ -94,7 +94,7 @@ class _Client extends DshClient {
   }
 
   @override
-  Future<SessionProjections?> projections(String sessionId) async {
+  Future<SessionProjections?> projections(String sessionId, {Duration? timeout}) async {
     projectionCalls++;
     return projectionRead?.future ?? SessionProjections.empty;
   }
