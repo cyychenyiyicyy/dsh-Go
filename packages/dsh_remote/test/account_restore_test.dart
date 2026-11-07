@@ -67,7 +67,11 @@ void main() {
       expect((await first)?.deviceId, original.deviceId);
       expect((await second)?.deviceId, original.deviceId);
       expect(await listing, isA<List<RemoteHost>>());
-      expect(store.reads, 3, reason: 'one identity, one credentials, and one host pins read');
+      expect(
+        store.reads,
+        4,
+        reason: 'one identity, one credentials, one host pins and one transport cooldowns read',
+      );
     });
     test('a failed $suffix read is reported and a later call restores', () async {
       final store = _ReadStore(saved.values)..failSuffix = suffix;

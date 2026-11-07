@@ -43,7 +43,9 @@ android {
     }
 
     defaultConfig {
-        applicationId = "io.github.ccch1mneyyy.dsh_app"
+        // Same code, separate install slot: lets the patched build live next to the
+        // release-signed app instead of needing an uninstall (signatures differ).
+        applicationId = "io.github.ccch1mneyyy.dsh_app.fix"
         // java.nio.file (symlinks while unpacking the rootfs) needs API 26.
         minSdk = 26
         // Target 28 like Termux, so the API 29+ exec restriction on app-private

@@ -22,7 +22,7 @@ class _Client extends DshClient {
   Stream<HostEvent> get hostEvents => events.stream;
 
   @override
-  Future<List<SessionSummary>> listSessions() {
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) {
     final request = requests.isEmpty ? ownerSnapshot : Completer<List<SessionSummary>>();
     requests.add(request);
     return request.future;

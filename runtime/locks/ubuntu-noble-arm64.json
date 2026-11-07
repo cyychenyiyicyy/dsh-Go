@@ -8,11 +8,11 @@
   "packages": [
     {
       "package": "ca-certificates",
-      "version": "20260816ubuntu0.24.04.1",
+      "version": "20260816ubuntu0.24.04.2",
       "architecture": "all",
-      "filename": "pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.1_all.deb",
-      "sha256": "8a0a754aaafed72cc8efb8c1731808133284a84fbfc76a4fcc73fce9e01b4187",
-      "size": 138884,
+      "filename": "pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.2_all.deb",
+      "sha256": "f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0",
+      "size": 140064,
       "installedSize": 330,
       "upgradesBase": null,
       "neededBy": "requested"

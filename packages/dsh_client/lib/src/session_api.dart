@@ -29,6 +29,18 @@ enum PromptMode {
   final String wire;
 }
 
+/// Budget for one `session/list` read.
+///
+/// The list is not paged: it carries every stored session, archived and
+/// subagent ones included, each with its projections. On a Host with a long
+/// history that is megabytes — over a tunnel that is seconds of transfer on
+/// top of the parse. Thirty seconds is far beyond what a healthy Host needs
+/// and far below what a stalled one costs the user.
+const sessionListTimeout = Duration(seconds: 30);
+
+/// Budget for one `session/projections` read (one session's title fill-in).
+const sessionProjectionTimeout = Duration(seconds: 20);
+
 /// Inline image for `session/prompt` (png, jpeg, webp, gif; 20 MiB per image,
 /// 20 images and 200 MiB per message by default — see
 /// `SessionProjections.imageLimits`).
@@ -206,6 +218,8 @@ class DshClient {
     bool backgroundLists = false,
     bool startMux = true,
     Duration readyTimeout = const Duration(seconds: 20),
+    Duration connectTimeout = const Duration(seconds: 10),
+    Duration requestTimeout = const Duration(seconds: 120),
   }) async {
     var base = baseUri;
     var launchToken = token;
@@ -216,7 +230,14 @@ class DshClient {
       launchToken ??= parsed.token;
     }
     if (base == null) throw ArgumentError('baseUri or launchUrl is required');
-    final connection = DshConnection(base, hostHeader: hostHeader, cookie: cookie, tracer: tracer);
+    final connection = DshConnection(
+      base,
+      hostHeader: hostHeader,
+      cookie: cookie,
+      tracer: tracer,
+      connectTimeout: connectTimeout,
+      requestTimeout: requestTimeout,
+    );
     final client = DshClient(
       connection,
       muxOptions: muxOptions,
@@ -320,10 +341,18 @@ class DshClient {
 
   /// `session/list`: every stored session, newest first, *including archived
   /// and subagent sessions*. Filter archived ones with [watchWorkspaces].
-  Future<List<SessionSummary>> listSessions() async {
+  ///
+  /// [timeout] bounds the read: the list carries every stored session with
+  /// its projections, so on a busy Host it is megabytes of JSON. A read that
+  /// has not answered by then is not going to answer soon enough to be worth
+  /// the spinner. The background read path is bounded by the connection's own
+  /// request timeout instead.
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async {
     final read = tryBackgroundListRead(BackgroundListKind.sessions);
     if (read != null) return (await read) as List<SessionSummary>;
-    final value = asMapOrEmpty(await rpc.call('session/list', {'_request': <String, Object?>{}}));
+    final value = asMapOrEmpty(
+      await rpc.call('session/list', {'_request': <String, Object?>{}}, timeout ?? sessionListTimeout),
+    );
     return asListOrEmpty(value['items']).map(SessionSummary.fromJson).toList(growable: false);
   }
 
@@ -387,10 +416,16 @@ class DshClient {
   }
 
   /// `session/projections`: non-activating read; `null` for unknown sessions.
-  Future<SessionProjections?> projections(String sessionId) async {
-    final value = await rpc.call('session/projections', {
-      'request': {'sessionId': sessionId},
-    });
+  ///
+  /// [timeout] bounds the read: the App asks for one session's projections
+  /// at a time to fill in missing titles, and a Host that stops answering
+  /// must not hold that queue open indefinitely.
+  Future<SessionProjections?> projections(String sessionId, {Duration? timeout}) async {
+    final value = await rpc.call(
+      'session/projections',
+      {'request': {'sessionId': sessionId}},
+      timeout ?? sessionProjectionTimeout,
+    );
     return value == null ? null : SessionProjections.fromJson(value);
   }
 

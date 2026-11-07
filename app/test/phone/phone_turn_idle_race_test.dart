@@ -16,7 +16,7 @@ class _Client extends DshClient {
   _Client() : super(DshConnection(Uri.parse('http://127.0.0.1:9')));
 
   @override
-  Future<List<SessionSummary>> listSessions() async => [notify.session('s1', running: true)];
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async => [notify.session('s1', running: true)];
 }
 
 class _Local extends LocalConnectionController {

@@ -18,7 +18,7 @@ class _Client extends DshClient {
   final requests = <Completer<List<SessionSummary>>>[];
 
   @override
-  Future<List<SessionSummary>> listSessions() {
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) {
     final result = Completer<List<SessionSummary>>();
     requests.add(result);
     return result.future;
