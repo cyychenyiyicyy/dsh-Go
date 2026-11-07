@@ -13,7 +13,7 @@ class _Client extends DshClient {
   final cancelled = <String>[];
 
   @override
-  Future<List<SessionSummary>> listSessions() async => [
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async => [
     SessionSummary(sessionId: 'busy', updatedAt: DateTime(2026), running: true, blank: false, agentAvailable: true),
     SessionSummary(sessionId: 'idle', updatedAt: DateTime(2026), running: false, blank: false, agentAvailable: true),
   ];

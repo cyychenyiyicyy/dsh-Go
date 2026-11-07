@@ -340,12 +340,21 @@ class RemoteAccount {
   _ActiveConnection? _active;
   final Map<String, DateTime> _directCooldown = {};
   final Map<String, DateTime> _turnCooldown = {};
+
+  /// How long a path that just failed is skipped.
+  ///
+  /// The old 45 s was shorter than the app's own reconnect backoff, so the
+  /// fallback chain was walked again and again. Ten minutes is long enough to
+  /// cover the next few launches; a changed network still clears it (see
+  /// the network hint below).
+  static const transportCooldown = Duration(minutes: 10);
   final Map<String, String> _networkHints = {};
   final StreamController<RemoteConnectionState> _connectionStates = StreamController.broadcast();
 
   String get _identityKey => 'dsh_remote.v1.$_scope.identity';
   String get _credentialsKey => 'dsh_remote.v1.$_scope.credentials';
   String get _pinsKey => 'dsh_remote.v1.$_scope.pins';
+  String get _cooldownsKey => 'dsh_remote.v1.$_scope.cooldowns';
 
   // ---------------------------------------------------------------------------
   // Account state
@@ -389,6 +398,62 @@ class RemoteAccount {
       _credentials = null;
     }
     _restored = true;
+    await _loadCooldowns();
+  }
+
+  /// Reads the transport cooldowns and the network hint they were set under.
+  ///
+  /// The in-memory maps only live as long as the process: an App that the
+  /// system killed starts the next launch knowing nothing about the paths
+  /// that just failed, and walks the whole fallback chain again — a direct
+  /// attempt that cannot work, a TURN attempt that cannot work, and only
+  /// then the Relay that does. Persisting them means the next launch goes
+  /// straight to what worked.
+  Future<void> _loadCooldowns() async {
+    try {
+      final stored = asMap(tryDecodeJson(await _secrets.read(_cooldownsKey) ?? ''));
+      if (stored == null) return;
+      final now = DateTime.now();
+      void read(String field, Map<String, DateTime> into) {
+        final hosts = asMap(stored[field]);
+        if (hosts == null) return;
+        for (final entry in hosts.entries) {
+          final at = DateTime.tryParse('${entry.value}');
+          if (at != null && at.isAfter(now)) into[entry.key] = at;
+        }
+      }
+
+      read('direct', _directCooldown);
+      read('turn', _turnCooldown);
+      final hints = asMap(stored['hint']);
+      if (hints != null) {
+        for (final entry in hints.entries) {
+          final key = '${entry.value}';
+          if (key.isNotEmpty) _networkHints[entry.key] = key;
+        }
+      }
+    } on Object {
+      // A missing or malformed store just means no cooldowns.
+    }
+  }
+
+  /// Writes the cooldowns down. A hint that survives a restart is what lets
+  /// the "the network changed, try the direct path again" rule work across
+  /// process boundaries.
+  Future<void> _saveCooldowns() async {
+    try {
+      final now = DateTime.now();
+      String live(Map<String, DateTime> cooldowns) => jsonEncode({
+        for (final entry in cooldowns.entries)
+          if (entry.value.isAfter(now)) entry.key: entry.value.toIso8601String(),
+      });
+      await _secrets.write(
+        _cooldownsKey,
+        jsonEncode({'direct': live(_directCooldown), 'turn': live(_turnCooldown), 'hint': _networkHints}),
+      );
+    } on Object {
+      // A hint that cannot be stored must never break a connection.
+    }
   }
 
   /// QR-capable sign-in providers of this Server (empty on a self-hosted
@@ -930,7 +995,7 @@ class RemoteAccount {
     unawaited(
       rpc.done.then((reason) {
         if (!reason.retryable || reason.code == 'CLIENT_CLOSED') return;
-        final until = DateTime.now().add(const Duration(seconds: 45));
+        final until = DateTime.now().add(transportCooldown);
         switch (transport is WebRtcTransport ? transport.actualMode ?? transport.mode : transport.mode) {
           case RemoteTransportMode.lan || RemoteTransportMode.p2p:
             _directCooldown[host.id] = until;
@@ -940,6 +1005,7 @@ class RemoteAccount {
           case RemoteTransportMode.relay:
             break;
         }
+        unawaited(_saveCooldowns());
       }),
     );
 
@@ -1078,6 +1144,7 @@ class RemoteAccount {
     if (oldHint != null && oldHint != hintKey) {
       _directCooldown.remove(hostId);
       _turnCooldown.remove(hostId);
+      unawaited(_saveCooldowns());
     }
     final now = DateTime.now();
     final skipDirect = _directCooldown[hostId]?.isAfter(now) ?? false;
@@ -1112,7 +1179,8 @@ class RemoteAccount {
       } on WebRtcUnavailable catch (error) {
         directFailed = true;
         reason = error.timedOut ? RemoteNetworkFallbackReason.directTimeout : RemoteNetworkFallbackReason.directFailed;
-        _directCooldown[hostId] = DateTime.now().add(const Duration(seconds: 45));
+        _directCooldown[hostId] = DateTime.now().add(transportCooldown);
+        unawaited(_saveCooldowns());
         _notifyFallback(reason);
       }
       if (wantTurn) {
@@ -1136,7 +1204,8 @@ class RemoteAccount {
         } else {
           reason = error.timedOut ? RemoteNetworkFallbackReason.turnTimeout : RemoteNetworkFallbackReason.turnFailed;
         }
-        _turnCooldown[hostId] = DateTime.now().add(const Duration(seconds: 45));
+        _turnCooldown[hostId] = DateTime.now().add(transportCooldown);
+        unawaited(_saveCooldowns());
         // Missing credentials should not duplicate the direct-stage reason.
         if (!error.turnUnavailable || !directFailed) {
           _notifyFallback(reason);

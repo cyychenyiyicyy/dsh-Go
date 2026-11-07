@@ -155,6 +155,7 @@ class DshConnection {
     HttpClient? httpClient,
     this.connectTimeout = const Duration(seconds: 10),
     this.requestTimeout = const Duration(seconds: 120),
+    this.loginTimeout = const Duration(seconds: 30),
     DshTracer? tracer,
   }) : baseUri = _normalizeBase(baseUri),
        _http = httpClient ?? HttpClient(),
@@ -176,6 +177,14 @@ class DshConnection {
   final String? hostHeader;
   final Duration connectTimeout;
   final Duration requestTimeout;
+
+  /// Budget for the login exchange (`GET /?token=…`).
+  ///
+  /// A login is one cheap request against a Host that is already listening:
+  /// it answers with a redirect and a cookie. It must not inherit the long
+  /// [requestTimeout] — over a tunnel a half-open socket would otherwise hang
+  /// the sign-in for two minutes before anything could retry.
+  final Duration loginTimeout;
   DshTracer? _tracer;
   DshTracer? get tracer => _tracer;
   set tracer(DshTracer? value) {
@@ -270,10 +279,10 @@ class DshConnection {
   /// `Set-Cookie: dsh-auth-...=v1....; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict`.
   /// A wrong token, a token from another process, or a token sent on another
   /// path answers 401.
-  Future<DshCookie> login(String token) async {
+  Future<DshCookie> login(String token, {Duration? timeout}) async {
     final uri = resolve('/', {'token': token});
     _trace('out', 'http', {'method': 'GET', 'path': '/?token=<redacted>'});
-    final response = await _exchange('GET', uri, followRedirects: false);
+    final response = await _exchange('GET', uri, followRedirects: false, timeout: timeout ?? loginTimeout);
     _trace('in', 'http', {'status': response.statusCode, 'path': '/'});
     if (response.statusCode == 401) {
       throw const DshHttpException(401, 'launch token rejected (stale token, other dsh process, or wrong host:port)');

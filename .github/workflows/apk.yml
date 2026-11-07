@@ -1,0 +1,91 @@
+# 云端打包 APK(不需要本地装任何工具链)
+#
+# 用法:
+#   bash setup.sh        # 一键:登录 → fork → 打补丁 → 装本文件 → 推送触发构建
+#
+# 授权:只有 GitHub 自己的登录。脚本会调 `gh auth login`,
+#       它给你一个设备码链接 https://github.com/login/device + 一串码,
+#       浏览器点一下即可。没有任何第三方服务需要授权。
+#
+# 为什么云端:本机装工具链要 Flutter + Android SDK + NDK ~8 GB,
+# runtime(Ubuntu rootfs + Node + DSH)还要再下 1~2 GB。云端跑一次约
+# 30~50 分钟,之后有缓存只要 10 分钟左右,本地什么都不用装。
+
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/remote-connect-latency
+      - main
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  GRADLE_VERSION: 9.3.1
+  TZ: Asia/Shanghai
+
+jobs:
+  apk:
+    name: arm64 release APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # runtime 的构建产物(Ubuntu rootfs + Node + DSH + PRoot,按 ABI)。
+      # 这是整轮最慢的一段:下载 rootfs、装 DSH、拼 PRoot 共享库。
+      # 缓存住它,以后每次只改 Dart 代码就不用重来。
+      - name: Restore the runtime cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            runtime/.cache
+            runtime/out
+          key: runtime-arm64-${{ hashFiles('runtime/build-runtime.sh', 'runtime/locks/**', 'runtime/patches/**', 'runtime/lib/**') }}
+          restore-keys: |
+            runtime-arm64-
+
+      - name: Build the bundled Linux runtime (arm64)
+        run: |
+          bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Flutter plugins and local.properties
+        working-directory: app
+        run: |
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - name: Build the APK
+        run: |
+          bash tooling/build-apk.sh --release -f arm64
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-apk
+          path: app/build/app/outputs/flutter-apk/app-arm64-release.apk
+          if-no-files-found: error
+          retention-days: 30

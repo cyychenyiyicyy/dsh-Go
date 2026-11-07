@@ -77,7 +77,7 @@ class _Client extends DshClient {
   int sessionsReads = 0;
 
   @override
-  Future<List<SessionSummary>> listSessions() {
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) {
     sessionsReads++;
     return sessionsReply!.future;
   }

@@ -19,7 +19,7 @@ class _Client extends DshClient {
   _Client(super.connection);
 
   @override
-  Future<List<SessionSummary>> listSessions() async => [notify.session('s1', running: true)];
+  Future<List<SessionSummary>> listSessions({Duration? timeout}) async => [notify.session('s1', running: true)];
 }
 
 class _Local extends LocalConnectionController {

@@ -543,6 +543,18 @@ class RemoteTunnelCarrier extends DshCarrier implements WorkspaceUploadCarrier {
     final perCall = timeout ?? callTimeout;
     final transferId = uuidV7();
     final totalChunks = (encoded.length + remoteTransferChunkBytes - 1) ~/ remoteTransferChunkBytes;
+    // The whole transfer replaces ONE call, so it gets ONE budget — not one
+    // budget per chunk. A chunked read of a multi-megabyte list is a dozen
+    // round trips, and a dozen of them at 65 s each is an hour of spinner.
+    final watch = Stopwatch()..start();
+    Duration left() {
+      final remaining = perCall - watch.elapsed;
+      if (remaining <= Duration.zero) {
+        throw const DshProtocolException('Remote transfer timed out');
+      }
+      return remaining;
+    }
+
     try {
       await rpc.call('harness.remote.transfer.open', {
         'transferId': transferId,
@@ -558,7 +570,7 @@ class RemoteTunnelCarrier extends DshCarrier implements WorkspaceUploadCarrier {
           'transferId': transferId,
           'index': index,
           'data': base64Encode(Uint8List.sublistView(encoded, start, end)),
-        }, timeout: perCall);
+        }, timeout: left());
       }
       final committed = asMapOrEmpty(
         await rpc.call('harness.remote.transfer.commit', {'transferId': transferId}, timeout: perCall),
@@ -577,7 +589,7 @@ class RemoteTunnelCarrier extends DshCarrier implements WorkspaceUploadCarrier {
       final out = BytesBuilder(copy: false);
       for (var index = 0; index < responseChunks!; index++) {
         final chunk = asMapOrEmpty(
-          await rpc.call('harness.remote.transfer.read', {'transferId': transferId, 'index': index}, timeout: perCall),
+          await rpc.call('harness.remote.transfer.read', {'transferId': transferId, 'index': index}, timeout: left()),
         );
         final data = asString(chunk['data']);
         if (chunk['transferId'] != transferId || chunk['index'] != index || data == null) {
